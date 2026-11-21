@@ -1,0 +1,7 @@
+# Ruff rules shared by local development and CI.
+line-length = 120
+
+[lint]
+ignore = [
+    "E402",
+]

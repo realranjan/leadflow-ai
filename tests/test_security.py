@@ -1,0 +1,65 @@
+"""Self-contained checks for backend/security.py. Run: python tests/test_security.py"""
+
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "backend"))
+
+from security import (
+    hash_password, verify_password, make_token, verify_token,
+    encrypt_secret, decrypt_secret,
+)
+
+SECRET = "test-secret"
+
+
+h = hash_password("hunter2!")
+assert verify_password("hunter2!", h)
+assert not verify_password("wrong", h)
+
+
+
+
+
+tok = make_token("user-123", SECRET)
+assert verify_token(tok, SECRET) == "user-123"
+
+
+try:
+    verify_token(tok[:-4] + "AAAA", SECRET)
+    raise AssertionError("tampered token accepted")
+except ValueError:
+    pass
+
+
+try:
+    verify_token(tok, "other-secret")
+    raise AssertionError("wrong-secret token accepted")
+except ValueError:
+    pass
+
+
+expired = make_token("user-123", SECRET, ttl_s=-10)
+try:
+    verify_token(expired, SECRET)
+    raise AssertionError("expired token accepted")
+except ValueError:
+    pass
+
+
+try:
+    verify_token("not-a-token", SECRET)
+    raise AssertionError("garbage token accepted")
+except ValueError:
+    pass
+
+enc = encrypt_secret("AIzaSy-test-key-1234", SECRET)
+assert "AIzaSy" not in enc
+assert decrypt_secret(enc, SECRET) == "AIzaSy-test-key-1234"
+try:
+    decrypt_secret(enc, "other-secret")
+    raise AssertionError("secret decrypted under the wrong key")
+except ValueError:
+    pass
+
+print("test_security.py: all checks passed")

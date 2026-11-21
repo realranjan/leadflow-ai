@@ -1,0 +1,22 @@
+# Files excluded from Docker build contexts.
+.git
+.github
+**/.venv
+**/venv
+**/node_modules
+**/__pycache__
+**/*.pyc
+frontend/dist
+
+**/.env
+**/.env.*
+
+v0-v1-v2.txt
+migrations.sql
+CLAUDE.md
+.claude
+company_icp.txt
+results
+sample_leads_*.csv
+*.md
+!README.md

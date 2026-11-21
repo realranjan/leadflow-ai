@@ -1,0 +1,85 @@
+"""
+security.py — password hashing, HMAC-signed session tokens, and encryption
+for user-supplied credentials. No network, so it stays unit-testable.
+"""
+
+import base64
+import hashlib
+import hmac
+import secrets
+import time
+
+import bcrypt
+from cryptography.fernet import Fernet, InvalidToken
+
+
+TOKEN_TTL_S = 60 * 60
+
+
+REFRESH_TTL_S = 14 * 24 * 3600
+
+
+_BCRYPT_ROUNDS = 10
+
+
+def hash_password(password: str) -> str:
+    return bcrypt.hashpw(password.encode(), bcrypt.gensalt(_BCRYPT_ROUNDS)).decode()
+
+
+def verify_password(password: str, hashed: str) -> bool:
+    try:
+        return bcrypt.checkpw(password.encode(), hashed.encode())
+    except ValueError:
+        return False
+
+
+def make_token(user_id: str, secret: str, ttl_s: int = TOKEN_TTL_S) -> str:
+    payload = f"{user_id}:{int(time.time()) + ttl_s}"
+    sig = hmac.new(secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
+    return base64.urlsafe_b64encode(f"{payload}:{sig}".encode()).decode()
+
+
+def verify_token(token: str, secret: str) -> str:
+    """Return the user_id if the token is valid and unexpired, else raise ValueError."""
+    try:
+        decoded = base64.urlsafe_b64decode(token.encode()).decode()
+        user_id, exp, sig = decoded.rsplit(":", 2)
+        payload = f"{user_id}:{exp}"
+        expected = hmac.new(secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
+        expired = time.time() > int(exp)
+    except Exception:
+        raise ValueError("malformed token")
+    if not hmac.compare_digest(sig, expected):
+        raise ValueError("bad signature")
+    if expired:
+        raise ValueError("token expired")
+    return user_id
+
+
+def make_refresh_token() -> tuple[str, str]:
+    """Return (raw_token, token_hash). The raw goes to the client once; only
+    the hash is persisted, so a DB leak can't be replayed as a valid token."""
+    raw = secrets.token_urlsafe(32)
+    return raw, hash_refresh_token(raw)
+
+
+def hash_refresh_token(raw: str) -> str:
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def _fernet(secret: str) -> Fernet:
+    """Derive a stable encryption key from the configured server secret."""
+    return Fernet(base64.urlsafe_b64encode(hashlib.sha256(secret.encode()).digest()))
+
+
+def encrypt_secret(plain: str, secret: str) -> str:
+    """Encrypt a user's credential for storage."""
+    return _fernet(secret).encrypt(plain.encode()).decode()
+
+
+def decrypt_secret(token: str, secret: str) -> str:
+    """Decrypt a credential, rejecting ciphertext from a different server key."""
+    try:
+        return _fernet(secret).decrypt(token.encode()).decode()
+    except InvalidToken as exc:
+        raise ValueError("cannot decrypt secret") from exc

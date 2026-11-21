@@ -1,0 +1,149 @@
+// Manages per-user SMTP settings.
+import { useState, useEffect } from 'react'
+import { api, friendlyError } from '../api'
+
+export default function EmailSettings({ onMessage }) {
+  const [expanded, setExpanded] = useState(false)
+  const [loaded, setLoaded] = useState(false)
+  const [configured, setConfigured] = useState(false)
+  const [passwordSaved, setPasswordSaved] = useState(false)
+  const [passwordLast4, setPasswordLast4] = useState(null)
+  const [fromAddress, setFromAddress] = useState('')
+  const [smtpHost, setSmtpHost] = useState('smtp.gmail.com')
+  const [smtpPort, setSmtpPort] = useState(587)
+  const [smtpPassword, setSmtpPassword] = useState('')
+  const [status, setStatus] = useState(null)
+  const [error, setError] = useState(null)
+
+  useEffect(() => {
+    api('GET', '/account/email-settings')
+      .then(data => {
+        setFromAddress(data.from_address || '')
+        setSmtpHost(data.smtp_host || 'smtp.gmail.com')
+        setSmtpPort(data.smtp_port || 587)
+        setConfigured(!!data.configured)
+        setPasswordSaved(!!data.password_saved)
+        setPasswordLast4(data.password_last4 || null)
+      })
+      .catch(() => {  })
+      .finally(() => setLoaded(true))
+  }, [])
+
+  async function handleSave() {
+    setStatus('saving')
+    setError(null)
+    try {
+      const result = await api('PUT', '/account/email-settings', {
+        smtp_host: smtpHost,
+        smtp_port: Number(smtpPort),
+        from_address: fromAddress,
+        smtp_password: smtpPassword || null,
+      })
+      setStatus('saved')
+      setConfigured(true)
+      setPasswordSaved(true)
+      setPasswordLast4(result.password_last4)
+      setSmtpPassword('')
+      setExpanded(false)
+      onMessage?.('Email sending settings saved.')
+      setTimeout(() => setStatus(null), 3000)
+    } catch (e) {
+      setStatus('error')
+      setError(friendlyError(e))
+    }
+  }
+
+  return (
+    <div className="card company-profile-card">
+      <div className="company-profile-header" role="button" tabIndex={0} aria-expanded={expanded}
+        onClick={() => setExpanded(!expanded)}
+        onKeyDown={e => {
+          if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setExpanded(!expanded) }
+        }}>
+        <div>
+          <h3 className="card-title" style={{ marginBottom: 0 }}>Email sending <span className="required-star">*</span></h3>
+          {!expanded && (
+            <p className="muted company-profile-summary">
+              {configured
+                ? `Sending as ${fromAddress}${passwordSaved ? ` · app password ••••${passwordLast4 || ''}` : ''}`
+                : 'Not set up — drafts can be edited but not sent.'}
+            </p>
+          )}
+        </div>
+        <span className="lead-card-chevron">{expanded ? '▲' : '▼'}</span>
+      </div>
+
+      {expanded && (
+        <>
+          <p className="muted" style={{ marginTop: '0.5rem' }}>
+            Connect your own email account to actually send drafted outreach,
+            not just view it. Works with any SMTP-capable provider — Gmail's
+            defaults are pre-filled, change the host/port for anything else.
+            For Gmail: enable 2-Step Verification, then create an{' '}
+            <a href="https://myaccount.google.com/apppasswords" target="_blank" rel="noreferrer">
+              App Password
+            </a>{' '}
+            (not your normal password) and paste it below.
+          </p>
+
+          <div className="form-group" style={{ marginTop: '0.75rem' }}>
+            <label>From address</label>
+            <input
+              type="email"
+              value={fromAddress}
+              onChange={e => setFromAddress(e.target.value)}
+              placeholder="you@example.com"
+              disabled={!loaded}
+            />
+          </div>
+          <div style={{ display: 'flex', gap: '0.75rem' }}>
+            <div className="form-group" style={{ flex: 2 }}>
+              <label>SMTP host</label>
+              <input
+                type="text"
+                value={smtpHost}
+                onChange={e => setSmtpHost(e.target.value)}
+                placeholder="smtp.gmail.com"
+                disabled={!loaded}
+              />
+            </div>
+            <div className="form-group" style={{ flex: 1 }}>
+              <label>Port</label>
+              <input
+                type="number"
+                value={smtpPort}
+                onChange={e => setSmtpPort(e.target.value)}
+                disabled={!loaded}
+              />
+            </div>
+          </div>
+          <div className="form-group">
+            <label>App password</label>
+            {passwordSaved && (
+              <div className="muted" style={{ fontSize: '0.8rem', marginBottom: '0.35rem' }}>
+                App password saved{passwordLast4 ? ` (ending in ••••${passwordLast4})` : ''} — leave blank to keep it, or type a new one to replace it.
+              </div>
+            )}
+            <input
+              type="password"
+              autoComplete="new-password"
+              value={smtpPassword}
+              onChange={e => setSmtpPassword(e.target.value)}
+              placeholder={passwordSaved ? '••••••••••••••••' : '16-character app password'}
+              disabled={!loaded}
+            />
+          </div>
+
+          {error && <div className="alert alert-error">{error}</div>}
+          <button
+            className="btn btn-primary"
+            onClick={handleSave}
+            disabled={status === 'saving' || !loaded || !fromAddress.trim() || !smtpHost.trim() || (!passwordSaved && !smtpPassword.trim())}
+          >
+            {status === 'saving' ? 'Saving…' : status === 'saved' ? 'Saved ✓' : 'Save email settings'}
+          </button>
+        </>
+      )}
+    </div>
+  )
+}

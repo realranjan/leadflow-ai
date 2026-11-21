@@ -1,0 +1,164 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="440" viewBox="0 0 1200 440" role="img" aria-labelledby="arch-title arch-desc">
+  <title id="arch-title">LeadFlow AI · Multi-Agent System Architecture</title>
+  <desc id="arch-desc">End-to-end architecture diagram showing React client, FastAPI queue, LangGraph agent worker, and Supabase database.</desc>
+
+  <defs>
+    <linearGradient id="arch-bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#080C14"/>
+      <stop offset="100%" stop-color="#0E1526"/>
+    </linearGradient>
+
+    <pattern id="arch-grid" width="20" height="20" patternUnits="userSpaceOnUse">
+      <circle cx="2" cy="2" r="0.8" fill="#334155" fill-opacity="0.3"/>
+    </pattern>
+  </defs>
+
+  <rect width="1200" height="440" rx="20" fill="url(#arch-bg)"/>
+  <rect width="1200" height="440" rx="20" fill="url(#arch-grid)"/>
+  <rect width="1200" height="440" rx="20" fill="none" stroke="#1E293B" stroke-width="2"/>
+
+  <!-- Title Section -->
+  <g transform="translate(48, 40)">
+    <text x="0" y="0" fill="#FFFFFF" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="24" font-weight="700">LeadFlow AI · System Architecture</text>
+    <text x="0" y="24" fill="#94A3B8" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="15">Asynchronous job leasing, parallel agent graph, 7-judge consensus &amp; distributed observability</text>
+  </g>
+
+  <!-- Columns / Tiers -->
+
+  <!-- Tier 1: Client Layer -->
+  <g transform="translate(48, 95)">
+    <rect width="240" height="300" rx="14" fill="#0D1322" stroke="#25334D" stroke-width="1.5"/>
+    <rect width="240" height="40" rx="14" fill="#141E33"/>
+    <text x="120" y="26" fill="#38BDF8" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="14" font-weight="700" text-anchor="middle">1 · CLIENT LAYER</text>
+
+    <!-- Sub-cards -->
+    <g transform="translate(16, 56)">
+      <rect width="208" height="64" rx="8" fill="#162032" stroke="#1E293B" stroke-width="1"/>
+      <text x="12" y="24" fill="#F8FAFC" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="13" font-weight="600">React 19 + Vite</text>
+      <text x="12" y="42" fill="#94A3B8" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="11">Real-time Lead Dashboard</text>
+      <text x="12" y="56" fill="#64748B" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="10">Per-agent live progress cards</text>
+    </g>
+
+    <g transform="translate(16, 132)">
+      <rect width="208" height="64" rx="8" fill="#162032" stroke="#1E293B" stroke-width="1"/>
+      <text x="12" y="24" fill="#F8FAFC" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="13" font-weight="600">ICP &amp; Settings Hub</text>
+      <text x="12" y="42" fill="#94A3B8" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="11">Company profile target specs</text>
+      <text x="12" y="56" fill="#64748B" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="10">BYO Gemini / Cloudflare keys</text>
+    </g>
+
+    <g transform="translate(16, 208)">
+      <rect width="208" height="74" rx="8" fill="#162032" stroke="#1E293B" stroke-width="1"/>
+      <text x="12" y="24" fill="#F8FAFC" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="13" font-weight="600">Outreach Studio</text>
+      <text x="12" y="42" fill="#94A3B8" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="11">Editable email drafts</text>
+      <text x="12" y="56" fill="#94A3B8" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="11">1-click direct SMTP dispatch</text>
+      <text x="12" y="68" fill="#34D399" font-family="ui-monospace, monospace" font-size="10">Borderline lead drafting</text>
+    </g>
+  </g>
+
+  <!-- Tier 2: API Gateway -->
+  <g transform="translate(328, 95)">
+    <rect width="240" height="300" rx="14" fill="#0D1322" stroke="#25334D" stroke-width="1.5"/>
+    <rect width="240" height="40" rx="14" fill="#141E33"/>
+    <text x="120" y="26" fill="#818CF8" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="14" font-weight="700" text-anchor="middle">2 · API &amp; QUEUE GATEWAY</text>
+
+    <!-- Sub-cards -->
+    <g transform="translate(16, 56)">
+      <rect width="208" height="64" rx="8" fill="#162032" stroke="#1E293B" stroke-width="1"/>
+      <text x="12" y="24" fill="#F8FAFC" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="13" font-weight="600">FastAPI Core</text>
+      <text x="12" y="42" fill="#94A3B8" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="11">Bcrypt + rotating refresh tokens</text>
+      <text x="12" y="56" fill="#64748B" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="10">Stateless HMAC verification</text>
+    </g>
+
+    <g transform="translate(16, 132)">
+      <rect width="208" height="74" rx="8" fill="#162032" stroke="#1E293B" stroke-width="1"/>
+      <text x="12" y="24" fill="#F8FAFC" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="13" font-weight="600">Async Job Enqueue</text>
+      <text x="12" y="42" fill="#34D399" font-family="ui-monospace, monospace" font-size="11">POST /leads/process → 202</text>
+      <text x="12" y="56" fill="#94A3B8" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="11">Idempotent submission key</text>
+      <text x="12" y="68" fill="#64748B" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="10">Job status polling (3s - 10s)</text>
+    </g>
+
+    <g transform="translate(16, 218)">
+      <rect width="208" height="64" rx="8" fill="#162032" stroke="#1E293B" stroke-width="1"/>
+      <text x="12" y="24" fill="#F8FAFC" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="13" font-weight="600">Security &amp; Rate Limits</text>
+      <text x="12" y="42" fill="#94A3B8" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="11">Supabase-backed 429 limiter</text>
+      <text x="12" y="56" fill="#64748B" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="10">Daily lead quota enforcement</text>
+    </g>
+  </g>
+
+  <!-- Tier 3: LangGraph Agent Engine -->
+  <g transform="translate(608, 95)">
+    <rect width="300" height="300" rx="14" fill="#0D1322" stroke="#6366F1" stroke-opacity="0.4" stroke-width="1.5"/>
+    <rect width="300" height="40" rx="14" fill="#161F38"/>
+    <text x="150" y="26" fill="#A5B4FC" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="14" font-weight="700" text-anchor="middle">3 · LANGGRAPH AGENTS</text>
+
+    <!-- Sub-cards -->
+    <g transform="translate(16, 52)">
+      <rect width="268" height="70" rx="8" fill="#162032" stroke="#1E293B" stroke-width="1"/>
+      <text x="12" y="22" fill="#F8FAFC" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="13" font-weight="600">Parallel Research Nodes</text>
+      <text x="12" y="40" fill="#38BDF8" font-family="ui-monospace, monospace" font-size="11">🏢 Company + 👤 Personal</text>
+      <text x="12" y="54" fill="#94A3B8" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="11">Tavily live search + scraping</text>
+      <text x="12" y="66" fill="#34D399" font-family="ui-monospace, monospace" font-size="9.5">Company cache (company, ICP) TTL</text>
+    </g>
+
+    <g transform="translate(16, 130)">
+      <rect width="268" height="74" rx="8" fill="#162032" stroke="#1E293B" stroke-width="1"/>
+      <text x="12" y="22" fill="#F8FAFC" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="13" font-weight="600">7-Judge Consensus Scoring</text>
+      <text x="12" y="40" fill="#CBD5E1" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="11">Demographic 20 · Firmographic 20</text>
+      <text x="12" y="54" fill="#CBD5E1" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="11">Behavioral 60 (Fit, Use Case, Eng)</text>
+      <text x="12" y="68" fill="#A5B4FC" font-family="ui-monospace, monospace" font-size="10">Llama 3.3 70B / Workers AI</text>
+    </g>
+
+    <g transform="translate(16, 212)">
+      <rect width="268" height="70" rx="8" fill="#162032" stroke="#1E293B" stroke-width="1"/>
+      <text x="12" y="22" fill="#F8FAFC" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="13" font-weight="600">Outreach Synthesizer</text>
+      <text x="12" y="40" fill="#34D399" font-family="ui-monospace, monospace" font-size="11">Trigger: Score &gt; 70</text>
+      <text x="12" y="54" fill="#94A3B8" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="11">Personalized hooks + value alignment</text>
+      <text x="12" y="66" fill="#64748B" font-family="ui-monospace, monospace" font-size="9.5">Gemini 3.6 Flash structured output</text>
+    </g>
+  </g>
+
+  <!-- Tier 4: Data & Observability -->
+  <g transform="translate(948, 95)">
+    <rect width="204" height="300" rx="14" fill="#0D1322" stroke="#25334D" stroke-width="1.5"/>
+    <rect width="204" height="40" rx="14" fill="#141E33"/>
+    <text x="102" y="26" fill="#34D399" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="14" font-weight="700" text-anchor="middle">4 · DATA &amp; OBS</text>
+
+    <!-- Sub-cards -->
+    <g transform="translate(14, 56)">
+      <rect width="176" height="66" rx="8" fill="#162032" stroke="#1E293B" stroke-width="1"/>
+      <text x="10" y="24" fill="#F8FAFC" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="13" font-weight="600">Supabase DB</text>
+      <text x="10" y="42" fill="#94A3B8" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="11">PostgreSQL + RLS</text>
+      <text x="10" y="56" fill="#64748B" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="10">Leads, Jobs, Audits</text>
+    </g>
+
+    <g transform="translate(14, 134)">
+      <rect width="176" height="66" rx="8" fill="#162032" stroke="#1E293B" stroke-width="1"/>
+      <text x="10" y="24" fill="#F8FAFC" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="13" font-weight="600">Company Cache</text>
+      <text x="10" y="42" fill="#94A3B8" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="11">Atomic lease claim</text>
+      <text x="10" y="56" fill="#64748B" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="10">Prevents repeated API fees</text>
+    </g>
+
+    <g transform="translate(14, 212)">
+      <rect width="176" height="70" rx="8" fill="#162032" stroke="#1E293B" stroke-width="1"/>
+      <text x="10" y="24" fill="#F8FAFC" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="13" font-weight="600">Langfuse &amp; Logs</text>
+      <text x="10" y="42" fill="#94A3B8" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="11">Full step traces</text>
+      <text x="10" y="56" fill="#94A3B8" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="11">Correlated JSON logs</text>
+      <text x="10" y="68" fill="#64748B" font-family="ui-monospace, monospace" font-size="9">Token &amp; Cost metrics</text>
+    </g>
+  </g>
+
+  <!-- Flow Arrows connecting the columns -->
+  <g fill="#6366F1">
+    <!-- Arrow 1 to 2 -->
+    <path d="M 296 230 L 320 230" stroke="#6366F1" stroke-width="2" stroke-dasharray="4 3"/>
+    <polygon points="320,230 314,226 314,234"/>
+
+    <!-- Arrow 2 to 3 -->
+    <path d="M 576 230 L 600 230" stroke="#6366F1" stroke-width="2" stroke-dasharray="4 3"/>
+    <polygon points="600,230 594,226 594,234"/>
+
+    <!-- Arrow 3 to 4 -->
+    <path d="M 916 230 L 940 230" stroke="#6366F1" stroke-width="2" stroke-dasharray="4 3"/>
+    <polygon points="940,230 934,226 934,234"/>
+  </g>
+</svg>

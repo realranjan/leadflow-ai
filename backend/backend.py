@@ -1,0 +1,1224 @@
+"""
+backend.py — FastAPI server wrapping the LangGraph pipeline + Supabase operations.
+
+Run the API:     uvicorn backend.backend:app --host 0.0.0.0 --port 8000
+Run the worker:  python backend/worker.py   (processes queued lead-scoring jobs)
+
+Lead processing is asynchronous: POST /leads/process enqueues a job row in
+Supabase and returns 202 immediately; worker.py picks it up and writes results.
+"""
+
+import os
+os.environ["PYTHONUTF8"] = "1"
+os.environ["PYTHONIOENCODING"] = "utf-8"
+
+import json
+import logging
+import secrets
+import smtplib
+import sys
+import uuid
+from datetime import datetime, timedelta, timezone
+from email.message import EmailMessage
+from typing import List, Literal, Optional
+
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+from dotenv import load_dotenv
+
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, BASE_DIR)
+load_dotenv(dotenv_path=os.path.join(BASE_DIR, ".env"))
+
+from logging_setup import configure_logging, request_context, lead_context
+from security import (
+    hash_password, verify_password, make_token, verify_token,
+    make_refresh_token, hash_refresh_token, REFRESH_TTL_S,
+    encrypt_secret, decrypt_secret,
+)
+
+
+configure_logging()
+logger = logging.getLogger("backend")
+
+
+import httpx
+from supabase import create_client, ClientOptions, acreate_client, AsyncClientOptions
+
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+if not SUPABASE_URL or not SUPABASE_KEY:
+    raise RuntimeError("SUPABASE_URL and SUPABASE_KEY must be set in backend/.env")
+
+
+class _RetryStaleConnTransport(httpx.HTTPTransport):
+    """Retry a read once when a pooled connection turns out to be already dead.
+
+    PostgREST closes idle keep-alive connections on its side; httpx only finds
+    out when it tries to reuse one, and raises RemoteProtocolError("Server
+    disconnected"), which surfaces to the user as a 500. Load testing measured
+    this at 15-20% of requests with 20 concurrent clients, and it clustered
+    right after idle periods rather than under pipeline load — i.e. it tracks
+    connection age, not traffic.
+
+    httpx's own `retries=` argument does not cover this; it only retries
+    connect failures. Retrying is restricted to methods that are safe to
+    replay: on a genuinely stale connection the request never reached the
+    server, but that is indistinguishable from one that arrived and whose
+    response was lost, so a POST is never retried.
+    """
+
+    _REPLAYABLE = frozenset({"GET", "HEAD", "OPTIONS"})
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        try:
+            return super().handle_request(request)
+        except httpx.RemoteProtocolError:
+            if request.method not in self._REPLAYABLE:
+                raise
+            logger.debug("Stale Supabase connection on %s, retrying once", request.url.path)
+            return super().handle_request(request)
+
+
+SUPABASE_POOL = httpx.Limits(max_connections=200, max_keepalive_connections=100)
+
+supabase = create_client(
+    SUPABASE_URL, SUPABASE_KEY,
+    options=ClientOptions(httpx_client=httpx.Client(transport=_RetryStaleConnTransport(limits=SUPABASE_POOL))),
+)
+
+
+class _AsyncRetryStaleConnTransport(httpx.AsyncHTTPTransport):
+    """Async counterpart of _RetryStaleConnTransport, for supabase_async below —
+    same fix, same reasoning."""
+
+    _REPLAYABLE = frozenset({"GET", "HEAD", "OPTIONS"})
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        try:
+            return await super().handle_async_request(request)
+        except httpx.RemoteProtocolError:
+            if request.method not in self._REPLAYABLE:
+                raise
+            logger.debug("Stale async Supabase connection on %s, retrying once", request.url.path)
+            return await super().handle_async_request(request)
+
+
+supabase_async = None
+
+SECRET_KEY = os.getenv("SECRET_KEY") or secrets.token_hex(32)
+if not os.getenv("SECRET_KEY"):
+    logger.warning(
+        "SECRET_KEY not set — generated a random one; sessions will not survive "
+        "restarts or be shared across instances. Set SECRET_KEY in backend/.env."
+    )
+
+
+_daily_lead_cap = os.getenv("DAILY_LEAD_CAP")
+if not _daily_lead_cap:
+    raise RuntimeError(
+        "DAILY_LEAD_CAP must be set (leads each account may process per day). "
+        "Set it in backend/.env locally and in the environment of whatever "
+        "hosts this in production."
+    )
+try:
+    DAILY_LEAD_CAP = int(_daily_lead_cap)
+except ValueError:
+    raise RuntimeError(f"DAILY_LEAD_CAP must be a whole number, got {_daily_lead_cap!r}")
+if DAILY_LEAD_CAP < 1:
+    raise RuntimeError(f"DAILY_LEAD_CAP must be at least 1, got {DAILY_LEAD_CAP}")
+
+MAX_LEADS_PER_REQUEST = DAILY_LEAD_CAP
+MAX_BULK_IMPORT = 200
+LOGIN_MAX_FAILURES = 5
+LOGIN_WINDOW_S = 900
+RATE_LIMITS = {
+    "login": (30, 60),
+    "signup": (5, 60),
+    "signup_global": (30, 60),
+    "refresh": (120, 60),
+    "process": (30, 60),
+    "draft_email": (5, 60),
+}
+EMAIL_SEND_DAILY_CAP = int(os.getenv("EMAIL_SEND_DAILY_CAP", "80"))
+
+
+try:
+    LLM_MODEL = os.environ["LLM_MODEL"].strip().upper()
+except KeyError:
+    raise RuntimeError(
+        "LLM_MODEL is required. Set it to GEMINI or CLOUDFLARE in backend/.env."
+    ) from None
+if LLM_MODEL == "CLOUDFLARE":
+    _llm_key_var = "CLOUDFLARE_API_TOKEN"
+    if not os.getenv("CLOUDFLARE_ACCOUNT_ID"):
+        raise RuntimeError(
+            "LLM_MODEL=CLOUDFLARE also needs CLOUDFLARE_ACCOUNT_ID. Failing at "
+            "startup rather than on the first lead, which would burn a credit."
+        )
+else:
+    _llm_key_var = "GEMINI_API_KEY"
+
+try:
+    LLM_API_KEY = os.environ[_llm_key_var]
+except KeyError:
+    raise RuntimeError(
+        f"LLM_MODEL={LLM_MODEL} requires {_llm_key_var} in the environment."
+    )
+
+TAVILY_API_KEY = os.environ["TAVILY_API_KEY"]
+
+
+_allowed_origins_raw = os.getenv("ALLOWED_ORIGINS")
+if not _allowed_origins_raw:
+    raise RuntimeError(
+        "ALLOWED_ORIGINS must be set — comma-separated frontend origins allowed "
+        "to call this API, e.g. https://your-frontend.example.com,http://localhost:5173. "
+        "Set it in backend/.env locally and in the environment of whatever hosts this in production."
+    )
+ALLOWED_ORIGINS = [o.strip() for o in _allowed_origins_raw.split(",") if o.strip()]
+
+
+app = FastAPI(title="LeadFlow AI Backend")
+
+
+@app.on_event("startup")
+async def _init_async_supabase():
+    global supabase_async
+    supabase_async = await acreate_client(
+        SUPABASE_URL, SUPABASE_KEY,
+        options=AsyncClientOptions(httpx_client=httpx.AsyncClient(
+            transport=_AsyncRetryStaleConnTransport(limits=SUPABASE_POOL))),
+    )
+
+
+_AUDITED_ROUTES = {
+    ("POST", "/auth/signup"): ("auth.signup", "user"),
+    ("POST", "/auth/login"): ("auth.login", "user"),
+    ("PUT", "/account/company-context"): ("account.company_context.updated", "user"),
+    ("PUT", "/account/email-settings"): ("account.email_settings.updated", "user"),
+    ("PUT", "/account/api-keys"): ("account.api_keys.updated", "user"),
+    ("DELETE", "/account/api-keys/{provider}"): ("account.api_key.removed", "user"),
+    ("POST", "/leads"): ("lead.created", "lead"),
+    ("POST", "/leads/bulk"): ("leads.imported", "leads"),
+    ("PUT", "/leads/{lead_id}"): ("lead.updated", "lead"),
+    ("DELETE", "/leads/{lead_id}"): ("lead.deleted", "lead"),
+    ("POST", "/leads/process"): ("job.submitted", "job"),
+    ("POST", "/leads/{lead_id}/draft-email"): ("email.drafted", "lead"),
+    ("POST", "/leads/{lead_id}/send-email"): ("email.sent", "lead"),
+}
+
+
+async def _record_audit_event(request: Request, request_id: str, status_code: int) -> None:
+    """Write one audit_events row for an audited route with a token-verified actor.
+
+    Only ids, action names and outcomes are stored — never request bodies, so
+    settings text, passwords and API keys can't leak into the audit table.
+    """
+    route = request.scope.get("route")
+    if route is None:
+        return
+    event = _AUDITED_ROUTES.get((request.method, route.path))
+    actor = getattr(request.state, "actor_user_id", None)
+    if not event or actor is None:
+        return
+    action, target_type = event
+    if action == "account.api_key.removed" and request.path_params.get("provider") in ("gemini", "tavily"):
+        action = f"account.api_key.{request.path_params['provider']}.removed"
+    target_id = getattr(request.state, "audit_target_id", None) or request.path_params.get("lead_id")
+    if target_type == "user":
+        target_id = actor
+    outcome = "success" if status_code < 400 else "rejected" if status_code < 500 else "error"
+    try:
+        await supabase_async.table("audit_events").insert({
+            "actor_user_id": int(actor),
+            "action": action,
+            "target_type": target_type,
+            "target_id": str(target_id) if target_id is not None else None,
+            "outcome": outcome,
+            "status_code": status_code,
+            "request_id": request_id,
+        }).execute()
+    except Exception:
+        logger.exception("Failed to record audit event %s for user %s", action, actor)
+
+
+@app.middleware("http")
+async def add_request_id(request: Request, call_next):
+    """Correlates requests with logs and records authenticated user actions."""
+    request_id = uuid.uuid4().hex[:12]
+    with request_context(request_id):
+        status_code = 500
+        try:
+            response = await call_next(request)
+            status_code = response.status_code
+        finally:
+            await _record_audit_event(request, request_id, status_code)
+    response.headers["X-Request-ID"] = request_id
+    return response
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.get("/")
+def health():
+    return {"status": "ok", "service": "LeadFlow AI Backend"}
+
+
+def current_user(request: Request, authorization: Optional[str] = Header(None)) -> str:
+    """FastAPI dependency: validate the Bearer token, return the user_id."""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing authentication token.")
+    try:
+        user_id = verify_token(authorization[len("Bearer "):], SECRET_KEY)
+        request.state.actor_user_id = user_id
+        return user_id
+    except ValueError:
+        raise HTTPException(status_code=401, detail="Invalid or expired token. Please log in again.")
+
+
+# Supabase-backed (not in-memory) so the lockout holds across multiple API
+# instances, not just per-process.
+def _recent_failure_count(username: str) -> int:
+    """Recent failed attempts in the lockout window.
+
+    Returns the count rather than a bool so login can also decide whether the
+    clear-failures DELETE is needed at all — see the call site.
+    """
+    cutoff = (datetime.now(timezone.utc) - timedelta(seconds=LOGIN_WINDOW_S)).isoformat()
+    resp = (
+        supabase.table("login_failures")
+        .select("id", count="exact")
+        .eq("username", username)
+        .gte("failed_at", cutoff)
+        .execute()
+    )
+    return resp.count or 0
+
+
+def _record_login_failure(username: str) -> None:
+    supabase.table("login_failures").insert({"username": username}).execute()
+
+
+def _clear_login_failures(username: str) -> None:
+    supabase.table("login_failures").delete().eq("username", username).execute()
+
+
+def _enforce_rate_limit(scope: str, subject: str, cost: int = 1) -> None:
+    """Consume an atomic Supabase-backed allowance shared by every API process."""
+    maximum, window = RATE_LIMITS[scope]
+    try:
+        rows = supabase.rpc("consume_rate_limit", {
+            "p_scope": scope, "p_subject": subject, "p_max_hits": maximum,
+            "p_window_seconds": window, "p_hits": cost,
+        }).execute().data
+        retry = rows[0]["retry_after_seconds"]
+        if not isinstance(retry, int) or retry < 0:
+            raise ValueError("Invalid rate limit response")
+    except Exception as exc:
+        logger.exception("Rate limiter unavailable for %s", scope)
+        raise HTTPException(status_code=503, detail="Rate limiter unavailable. Try again shortly.") from exc
+    if retry:
+        raise HTTPException(status_code=429, detail="Too many requests. Try again later.",
+                            headers={"Retry-After": str(retry)})
+
+
+class SignupRequest(BaseModel):
+    username: str = Field(min_length=3, max_length=50)
+    password: str = Field(min_length=8, max_length=128)
+
+class LoginRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=50)
+    password: str = Field(min_length=1, max_length=128)
+
+class LoginResponse(BaseModel):
+    user_id: str
+    username: str
+    token: str
+    refresh_token: str
+
+class RefreshRequest(BaseModel):
+    refresh_token: str
+
+class LeadCreate(BaseModel):
+    name: str
+    job_title: Optional[str] = None
+    company: str
+    email: str
+    use_case: Optional[str] = None
+    industry: Optional[str] = None
+    location: Optional[str] = None
+    source: Optional[str] = "Website"
+
+class LeadUpdate(BaseModel):
+    name: Optional[str] = None
+    job_title: Optional[str] = None
+    company: Optional[str] = None
+    email: Optional[str] = None
+    use_case: Optional[str] = None
+    industry: Optional[str] = None
+    location: Optional[str] = None
+    source: Optional[str] = None
+    email_draft: Optional[str] = None
+
+class BulkLeadsRequest(BaseModel):
+    leads: List[LeadCreate] = Field(min_length=1, max_length=MAX_BULK_IMPORT)
+
+class ProcessLeadsRequest(BaseModel):
+    leads: List[dict]
+    force_refresh: bool = False
+
+class CompanyProfileRequest(BaseModel):
+    company_context: str = Field(max_length=4000)
+
+class EmailSettingsRequest(BaseModel):
+    smtp_host: str = Field(min_length=1, max_length=255)
+    smtp_port: int = Field(default=587, ge=1, le=65535)
+    from_address: str = Field(min_length=3, max_length=255)
+
+
+    smtp_password: Optional[str] = Field(default=None, max_length=255)
+
+
+class ApiKeysRequest(BaseModel):
+    """Optional per-user model choice and credentials; Tavily is separate from the model choice."""
+    llm_provider: Optional[Literal["APP", "GEMINI", "CLOUDFLARE"]] = None
+    gemini_api_key: Optional[str] = Field(default=None, max_length=300)
+    cloudflare_account_id: Optional[str] = Field(default=None, max_length=100)
+    cloudflare_api_token: Optional[str] = Field(default=None, max_length=300)
+    tavily_api_key: Optional[str] = Field(default=None, max_length=300)
+
+
+@app.post("/auth/signup", response_model=LoginResponse)
+def signup(req: SignupRequest, request: Request):
+    _enforce_rate_limit("signup_global", "all")
+    _enforce_rate_limit("signup", req.username.lower())
+    existing = supabase.table("users").select("id").eq("username", req.username).execute()
+    if existing.data:
+        raise HTTPException(status_code=400, detail="Username already exists.")
+    try:
+        created = supabase.table("users").insert(
+            {"username": req.username, "password": hash_password(req.password)}
+        ).execute()
+    except Exception:
+
+        raise HTTPException(status_code=400, detail="Username already exists.")
+    if not created.data:
+        raise HTTPException(status_code=500, detail="Signup failed. Please try again.")
+    row = created.data[0]
+    uid = str(row["id"])
+
+    logger.info("New user signed up: %s", req.username)
+
+    response = LoginResponse(
+        user_id=uid, username=req.username,
+        token=make_token(uid, SECRET_KEY),
+        refresh_token=_issue_refresh_token(row["id"]),
+    )
+    request.state.actor_user_id = uid
+    return response
+
+
+@app.post("/auth/login", response_model=LoginResponse)
+def login(req: LoginRequest, request: Request):
+    _enforce_rate_limit("login", req.username.lower())
+    recent_failures = _recent_failure_count(req.username)
+    if recent_failures >= LOGIN_MAX_FAILURES:
+        raise HTTPException(
+            status_code=429,
+            detail="Too many failed attempts. Try again in a few minutes.",
+            headers={"Retry-After": str(LOGIN_WINDOW_S)},
+        )
+    user = supabase.table("users").select("*").eq("username", req.username).execute()
+    if not user.data or not verify_password(req.password, user.data[0]["password"]):
+        _record_login_failure(req.username)
+        raise HTTPException(status_code=401, detail="Invalid username or password.")
+    row = user.data[0]
+    if recent_failures:
+        _clear_login_failures(req.username)
+    uid = str(row["id"])
+    logger.info("User logged in: %s", req.username)
+    response = LoginResponse(
+        user_id=uid, username=req.username,
+        token=make_token(uid, SECRET_KEY),
+        refresh_token=_issue_refresh_token(row["id"]),
+    )
+    request.state.actor_user_id = uid
+    return response
+
+
+def _issue_refresh_token(user_id) -> str:
+    """Create a refresh token, store only its hash, return the raw value (shown
+    to the client once). See the refresh_tokens table in migrations.sql."""
+    raw, token_hash = make_refresh_token()
+    expires_at = (datetime.now(timezone.utc) + timedelta(seconds=REFRESH_TTL_S)).isoformat()
+    supabase.table("refresh_tokens").insert({
+        "user_id": user_id, "token_hash": token_hash, "expires_at": expires_at,
+    }).execute()
+    return raw
+
+
+@app.post("/auth/refresh")
+def refresh_access_token(req: RefreshRequest):
+    """Exchange a valid (unexpired, unrevoked) refresh token for a new access
+    token. The refresh token itself is unchanged and keeps its own expiry."""
+    _enforce_rate_limit("refresh", hash_refresh_token(req.refresh_token)[:64])
+    now = datetime.now(timezone.utc).isoformat()
+    resp = (
+        supabase.table("refresh_tokens")
+        .select("user_id")
+        .eq("token_hash", hash_refresh_token(req.refresh_token))
+        .gt("expires_at", now)
+        .execute()
+    )
+    if not resp.data:
+        raise HTTPException(status_code=401, detail="Session expired. Please log in again.")
+    uid = str(resp.data[0]["user_id"])
+    return {"token": make_token(uid, SECRET_KEY)}
+
+
+@app.post("/auth/logout")
+def logout(req: RefreshRequest):
+    """Revoke a refresh token (delete it) so it can't mint more access tokens."""
+    supabase.table("refresh_tokens").delete().eq(
+        "token_hash", hash_refresh_token(req.refresh_token)
+    ).execute()
+    return {"message": "Logged out."}
+
+
+@app.get("/account/company-context")
+def get_company_context(user_id: str = Depends(current_user)):
+    resp = supabase.table("users").select("company_context").eq("id", user_id).execute()
+    context = resp.data[0].get("company_context") if resp.data else None
+    return {"company_context": context or ""}
+
+
+@app.put("/account/company-context")
+def set_company_context(req: CompanyProfileRequest, user_id: str = Depends(current_user)):
+    supabase.table("users").update({"company_context": req.company_context}).eq("id", user_id).execute()
+    return {"message": "Company profile saved."}
+
+
+def _require_credential_secret() -> None:
+    """Refuse to store recoverable credentials under a throwaway server key."""
+    if not os.getenv("SECRET_KEY"):
+        raise HTTPException(status_code=503, detail="Server secret is not configured for saved credentials.")
+
+
+def _smtp_password(user_id: str, stored: str) -> str:
+    """Decrypt a saved SMTP password."""
+    _require_credential_secret()
+    try:
+        return decrypt_secret(stored, SECRET_KEY)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400, detail="Your saved app password can't be read — please enter it again in Settings.",
+        ) from exc
+
+
+@app.get("/account/email-settings")
+def get_email_settings(user_id: str = Depends(current_user)):
+    resp = (
+        supabase.table("users")
+        .select("email_smtp_host,email_smtp_port,email_from_address,email_smtp_password")
+        .eq("id", user_id).execute()
+    )
+    row = resp.data[0] if resp.data else {}
+    stored = row.get("email_smtp_password")
+    return {
+        "smtp_host": row.get("email_smtp_host") or "",
+        "smtp_port": row.get("email_smtp_port") or 587,
+        "from_address": row.get("email_from_address") or "",
+        "configured": bool(row.get("email_from_address")),
+        "password_saved": bool(stored),
+        "password_last4": _smtp_password(user_id, stored)[-4:] if stored else None,
+    }
+
+
+@app.put("/account/email-settings")
+def set_email_settings(req: EmailSettingsRequest, user_id: str = Depends(current_user)):
+    """Save SMTP settings only after the server can actually log in with them."""
+    _require_credential_secret()
+    payload = {
+        "email_smtp_host": req.smtp_host,
+        "email_smtp_port": req.smtp_port,
+        "email_from_address": req.from_address,
+    }
+    if req.smtp_password:
+        password = req.smtp_password
+        payload["email_smtp_password"] = encrypt_secret(password, SECRET_KEY)
+    else:
+        existing = supabase.table("users").select("email_smtp_password").eq("id", user_id).execute()
+        stored = existing.data[0].get("email_smtp_password") if existing.data else None
+        if not stored:
+            raise HTTPException(status_code=400, detail="App password is required for first-time setup.")
+        password = _smtp_password(user_id, stored)
+
+    try:
+        with smtplib.SMTP(req.smtp_host, req.smtp_port, timeout=20) as server:
+            server.starttls()
+            server.login(req.from_address, password)
+    except smtplib.SMTPAuthenticationError as exc:
+        raise HTTPException(
+            status_code=400, detail="SMTP rejected this address or app password. Check that both belong to the same account.",
+        ) from exc
+    except (smtplib.SMTPException, OSError) as exc:
+        raise HTTPException(
+            status_code=502, detail="Could not verify SMTP login. Check the host, port and connection, then try again.",
+        ) from exc
+
+    supabase.table("users").update(payload).eq("id", user_id).execute()
+    return {"message": "Email sending settings saved.", "password_last4": password[-4:]}
+
+
+_API_KEY_COLUMNS = {
+    "gemini": "gemini_api_key_enc",
+    "cloudflare_account_id": "cloudflare_account_id_enc",
+    "cloudflare_api_token": "cloudflare_api_token_enc",
+    "tavily": "tavily_api_key_enc",
+}
+_MISSING_COLUMN_CODES = {"42703", "PGRST204"}
+
+
+def _user_api_keys(user_id: str) -> dict:
+    """Return this user's decrypted keys and chosen model; a missing migration means none saved, not an outage."""
+    from postgrest.exceptions import APIError
+
+    empty = {**{name: None for name in _API_KEY_COLUMNS}, "provider": None}
+    try:
+        resp = (supabase.table("users").select(",".join([*_API_KEY_COLUMNS.values(), "llm_provider"]))
+                .eq("id", user_id).execute())
+    except APIError as exc:
+        if getattr(exc, "code", None) in _MISSING_COLUMN_CODES:
+            return empty
+        raise
+    row = resp.data[0] if resp.data else {}
+    keys = {**empty, "provider": row.get("llm_provider")}
+    for name, column in _API_KEY_COLUMNS.items():
+        if row.get(column) and os.getenv("SECRET_KEY"):
+            try:
+                keys[name] = decrypt_secret(row[column], SECRET_KEY)
+            except ValueError:
+                logger.warning("Stored %s key for user %s can't be decrypted; ignoring it", name, user_id)
+    return keys
+
+
+def _own_llm(own: dict) -> Optional[dict]:
+    """The user's complete model credentials for their chosen provider, or None to use the operator's model.
+
+    "APP" chooses the operator's model. A Gemini key saved before the model
+    choice existed has no provider and still counts as Gemini.
+    """
+    provider = own["provider"] or ("GEMINI" if own["gemini"] else None)
+    if provider == "GEMINI" and own["gemini"]:
+        return {"provider": "GEMINI", "key": own["gemini"], "account_id": None}
+    if provider == "CLOUDFLARE" and own["cloudflare_api_token"] and own["cloudflare_account_id"]:
+        return {"provider": "CLOUDFLARE", "key": own["cloudflare_api_token"],
+                "account_id": own["cloudflare_account_id"]}
+    return None
+
+
+def _resolve_api_keys(user_id: str, for_job: bool = False) -> tuple:
+    """Return (llm_key, tavily_key, uses_own_keys, own_llm), preferring the user's keys.
+
+    Complete credentials for the user's chosen model run their jobs on that
+    provider whatever LLM_MODEL is; otherwise the operator's model serves them
+    under daily credits. Model credentials plus a Tavily key lift the cap. With
+    for_job, the user's model credentials are queued as one encrypted
+    'enc:{json}' value and the Tavily key as 'enc:…', for worker._job_llm and
+    worker._job_key.
+    """
+    own = _user_api_keys(user_id)
+    own_llm = _own_llm(own)
+    llm_key = own_llm["key"] if own_llm else LLM_API_KEY
+    tavily_key = own["tavily"] or TAVILY_API_KEY
+    if for_job:
+        if own_llm:
+            llm_key = "enc:" + encrypt_secret(json.dumps(own_llm), SECRET_KEY)
+        if own["tavily"]:
+            tavily_key = "enc:" + encrypt_secret(own["tavily"], SECRET_KEY)
+    return llm_key, tavily_key, bool(own_llm and own["tavily"]), own_llm
+
+
+@app.get("/account/api-keys")
+def get_api_keys(user_id: str = Depends(current_user)):
+    own = _user_api_keys(user_id)
+    own_llm = _own_llm(own)
+    return {
+        **{name: {"saved": bool(own[name]), "last4": own[name][-4:] if own[name] else None}
+           for name in _API_KEY_COLUMNS},
+        "provider": own["provider"] or ("GEMINI" if own["gemini"] else None),
+        "default_provider": LLM_MODEL,
+        "active_provider": own_llm["provider"] if own_llm else LLM_MODEL,
+        "unlimited": bool(own_llm and own["tavily"]),
+    }
+
+
+@app.put("/account/api-keys")
+def set_api_keys(req: ApiKeysRequest, user_id: str = Depends(current_user)):
+    """Encrypt and save the supplied keys and model choice; keys are never returned or logged."""
+    _require_credential_secret()
+    payload = {"llm_provider": req.llm_provider} if req.llm_provider else {}
+    for name in _API_KEY_COLUMNS:
+        value = getattr(req, "gemini_api_key" if name == "gemini" else
+                        "tavily_api_key" if name == "tavily" else name)
+        if value and value.strip():
+            payload[_API_KEY_COLUMNS[name]] = encrypt_secret(value.strip(), SECRET_KEY)
+    if not payload:
+        raise HTTPException(status_code=400, detail="Choose a model or enter at least one key.")
+    supabase.table("users").update(payload).eq("id", user_id).execute()
+    return {"message": "API keys saved."}
+
+
+@app.delete("/account/api-keys/{provider}")
+def delete_api_key(provider: str, user_id: str = Depends(current_user)):
+    if provider not in _API_KEY_COLUMNS:
+        raise HTTPException(status_code=404, detail="Unknown provider.")
+    supabase.table("users").update({_API_KEY_COLUMNS[provider]: None}).eq("id", user_id).execute()
+    return {"message": "Key removed."}
+
+
+def _seconds_until_utc_midnight() -> int:
+    """For Retry-After on the daily caps, which reset at UTC midnight."""
+    now = datetime.now(timezone.utc)
+    tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return max(1, int((tomorrow - now).total_seconds()))
+
+
+def _leads_used_today(user_id: str) -> int:
+    """Leads charged to this user since UTC midnight.
+
+    Successful jobs are charged, and so are pending or running ones, since
+    those credits are reserved until the job finishes. Otherwise a user could
+    queue far past the cap before anything completed. A failed job refunds its
+    leads, including jobs reaped as stale. Reset is free: at midnight the window
+    moves, so there's no credits table and no nightly restore job.
+    """
+    since = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    rows = (
+        supabase.table("jobs").select("leads")
+        .eq("user_id", user_id).gte("created_at", since.isoformat())
+        .neq("status", "failed").execute()
+    ).data or []
+    return sum(len(r.get("leads") or []) for r in rows)
+
+
+@app.get("/account/credits")
+def get_credits(user_id: str = Depends(current_user)):
+    """Daily lead credits for operator-paid jobs; none when the user brings model credentials and a Tavily key."""
+    if _resolve_api_keys(user_id)[2]:
+        return {"unlimited": True, "cap": None, "used": None, "remaining": None}
+    used = _leads_used_today(user_id)
+    return {"unlimited": False, "cap": DAILY_LEAD_CAP, "used": used,
+            "remaining": max(0, DAILY_LEAD_CAP - used)}
+
+
+def _get_owned_lead(lead_id: str, user_id: str) -> dict:
+    resp = supabase.table("leads").select("*").eq("id", lead_id).execute()
+    if not resp.data or str(resp.data[0].get("user_id")) != user_id:
+        raise HTTPException(status_code=404, detail="Lead not found.")
+    return resp.data[0]
+
+
+LEAD_LIST_COLUMNS = (
+    "id,name,job_title,company,email,use_case,industry,location,source,"
+    "score,created_at,email_sent_at"
+)
+
+
+@app.get("/leads/{user_id}")
+async def get_leads(
+    user_id: str,
+    auth_user: str = Depends(current_user),
+    limit: int = Query(500, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+):
+
+    if user_id != auth_user:
+        raise HTTPException(status_code=403, detail="Forbidden.")
+    resp = await (
+        supabase_async.table("leads")
+        .select(LEAD_LIST_COLUMNS)
+        .eq("user_id", user_id)
+        .order("created_at", desc=True)
+        .range(offset, offset + limit - 1)
+        .execute()
+    )
+    leads = resp.data or []
+    if leads:
+        runs = await (
+            supabase_async.table("analysis_runs")
+            .select("lead_id,total_tokens,total_cost,created_at")
+            .in_("lead_id", [lead["id"] for lead in leads])
+            .order("created_at", desc=True)
+            .execute()
+        )
+        by_lead = {}
+        for run in runs.data or []:
+            by_lead.setdefault(run["lead_id"], run)
+        for lead in leads:
+            run = by_lead.get(lead["id"])
+            lead["total_tokens"] = run["total_tokens"] if run else None
+            lead["total_cost"] = run["total_cost"] if run else None
+            lead["processed_at"] = run["created_at"] if run else None
+    return leads
+
+
+@app.get("/leads/{lead_id}/detail")
+async def get_lead_detail(lead_id: str, user_id: str = Depends(current_user)):
+    """The heavy fields for one lead, fetched when its card is expanded.
+
+    Two path segments, so this does not collide with the one-segment
+    GET /leads/{user_id} list route above.
+    """
+    resp = await (
+        supabase_async.table("leads")
+        .select("id,user_id,scoring_result,email_draft")
+        .eq("id", lead_id)
+        .execute()
+    )
+    if not resp.data or str(resp.data[0].get("user_id")) != user_id:
+        raise HTTPException(status_code=404, detail="Lead not found.")
+    row = resp.data[0]
+    row.pop("user_id", None)
+    return row
+
+
+@app.post("/leads")
+def create_lead(lead: LeadCreate, request: Request, user_id: str = Depends(current_user)):
+    payload = lead.dict()
+    payload["user_id"] = user_id
+    resp = supabase.table("leads").insert(payload).execute()
+    if resp.data:
+        request.state.audit_target_id = resp.data[0]["id"]
+    return resp.data[0] if resp.data else {}
+
+
+@app.post("/leads/bulk", status_code=201)
+def create_leads_bulk(req: BulkLeadsRequest, user_id: str = Depends(current_user)):
+    """Insert many leads in one call (CSV import). Only creates rows — the
+    caller then enqueues processing in MAX_LEADS_PER_REQUEST-sized batches.
+
+    Rows whose email this user already has are skipped rather than inserted:
+    re-importing a file after a partially failed run is a normal recovery
+    step, and it shouldn't silently double every lead. Duplicates *within*
+    the uploaded file are collapsed the same way.
+    """
+
+    existing = supabase.table("leads").select("email").eq("user_id", user_id).execute().data or []
+    seen = {(r.get("email") or "").strip().lower() for r in existing}
+
+    to_insert, skipped = [], []
+    for lead in req.leads:
+        data = lead.dict()
+        key = (data.get("email") or "").strip().lower()
+        if key in seen:
+            skipped.append(data.get("email"))
+            continue
+        seen.add(key)
+        to_insert.append({**data, "user_id": user_id})
+
+    created = []
+    if to_insert:
+        created = supabase.table("leads").insert(to_insert).execute().data or []
+    logger.info(
+        "Bulk import for user %s: %d created, %d skipped as duplicates",
+        user_id, len(created), len(skipped),
+    )
+    return {"created": created, "skipped": skipped}
+
+
+@app.put("/leads/{lead_id}")
+def update_lead(lead_id: str, lead: LeadUpdate, user_id: str = Depends(current_user)):
+    _get_owned_lead(lead_id, user_id)
+    payload = lead.dict(exclude_unset=True)
+    resp = supabase.table("leads").update(payload).eq("id", lead_id).execute()
+    return resp.data[0] if resp.data else {}
+
+
+@app.delete("/leads/{lead_id}")
+def delete_lead(lead_id: str, user_id: str = Depends(current_user)):
+    _get_owned_lead(lead_id, user_id)
+    supabase.table("leads").delete().eq("id", lead_id).execute()
+    return {"message": "Lead deleted."}
+
+
+def _split_subject(draft: str) -> tuple[str, str]:
+    """The email crew drafts 'Subject: ...' as the first line — pull that out
+    for the actual SMTP Subject header instead of leaving it duplicated at
+    the top of the body."""
+    first_line, _, rest = draft.partition("\n")
+    if first_line.strip().lower().startswith("subject:"):
+        return first_line.split(":", 1)[1].strip(), rest.lstrip("\n")
+    return "", draft
+
+
+@app.post("/leads/{lead_id}/send-email")
+def send_lead_email(lead_id: str, user_id: str = Depends(current_user)):
+    lead = _get_owned_lead(lead_id, user_id)
+    if not lead.get("email_draft"):
+        raise HTTPException(status_code=400, detail="No email draft to send — process this lead first.")
+    if not lead.get("email"):
+        raise HTTPException(status_code=400, detail="This lead has no email address.")
+
+    settings = (
+        supabase.table("users")
+        .select("email_smtp_host,email_smtp_port,email_from_address,email_smtp_password")
+        .eq("id", user_id).execute()
+    )
+    row = settings.data[0] if settings.data else {}
+    host, port, from_addr, password = (
+        row.get("email_smtp_host"), row.get("email_smtp_port"),
+        row.get("email_from_address"), row.get("email_smtp_password"),
+    )
+    if not (host and from_addr and password):
+        raise HTTPException(status_code=400, detail="Set up your email sending settings before sending.")
+    password = _smtp_password(user_id, password)
+
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+    sent_today = (
+        supabase.table("leads").select("id", count="exact")
+        .eq("user_id", user_id).gte("email_sent_at", cutoff).execute()
+    )
+    if (sent_today.count or 0) >= EMAIL_SEND_DAILY_CAP:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Daily email send limit ({EMAIL_SEND_DAILY_CAP}) reached. Try again tomorrow.",
+            headers={"Retry-After": str(_seconds_until_utc_midnight())},
+        )
+
+    subject, body = _split_subject(lead["email_draft"])
+    msg = EmailMessage()
+    msg["From"] = from_addr
+    msg["To"] = lead["email"]
+    msg["Subject"] = subject or f"Following up — {lead.get('company') or lead['name']}"
+    msg.set_content(body)
+
+    try:
+        with smtplib.SMTP(host, port, timeout=20) as server:
+            server.starttls()
+            server.login(from_addr, password)
+            server.send_message(msg)
+    except Exception as exc:
+        logger.exception("Failed to send email for lead %s", lead_id)
+        raise HTTPException(status_code=502, detail=f"Failed to send email: {exc}")
+
+    sent_at = datetime.now(timezone.utc).isoformat()
+    supabase.table("leads").update({"email_sent_at": sent_at}).eq("id", lead_id).execute()
+    logger.info("Email sent for lead %s", lead_id)
+    return {"message": "Email sent.", "sent_at": sent_at}
+
+
+BORDERLINE_LOW = 65
+
+
+@app.post("/leads/{lead_id}/draft-email")
+def draft_email_for_lead(lead_id: str, user_id: str = Depends(current_user)):
+
+
+    from pipeline import EMAIL_SCORE_THRESHOLD, draft_email
+
+    lead = _get_owned_lead(lead_id, user_id)
+    if lead.get("email_draft"):
+        raise HTTPException(status_code=400, detail="This lead already has an email draft.")
+    if not lead.get("scoring_result"):
+        raise HTTPException(status_code=400, detail="This lead has not been scored yet.")
+
+
+    score = lead.get("score")
+    if score is None or not BORDERLINE_LOW <= score <= EMAIL_SCORE_THRESHOLD:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Only leads scoring {BORDERLINE_LOW}-{EMAIL_SCORE_THRESHOLD} can be drafted on demand.",
+        )
+
+    profile = supabase.table("users").select("company_context").eq("id", user_id).execute()
+    company_context = (profile.data[0].get("company_context") if profile.data else None) or ""
+    if not company_context.strip():
+        raise HTTPException(status_code=400, detail="Set your company profile & ICP first.")
+    _enforce_rate_limit("draft_email", user_id)
+
+    try:
+        llm_key, _, _, own_llm = _resolve_api_keys(user_id)
+        draft = draft_email(llm_key, lead["scoring_result"], company_context,
+                            own_llm and own_llm["provider"], own_llm and own_llm["account_id"])
+    except Exception:
+        logger.exception("Failed to draft email for lead %s", lead_id)
+        raise HTTPException(status_code=502, detail="Couldn't draft the email right now. Try again shortly.")
+
+    supabase.table("leads").update({"email_draft": draft}).eq("id", lead_id).execute()
+    logger.info("Drafted email on demand for borderline lead %s (score %s)", lead_id, score)
+    return {"email_draft": draft}
+
+
+@app.post("/leads/process", status_code=202)
+def process_leads_endpoint(
+    req: ProcessLeadsRequest,
+    request: Request,
+    response: Response,
+    user_id: str = Depends(current_user),
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key", max_length=200),
+):
+
+
+    if idempotency_key:
+        prior = (
+            supabase.table("jobs")
+            .select("id,status")
+            .eq("user_id", user_id)
+            .eq("idempotency_key", idempotency_key)
+            .limit(1)
+            .execute()
+        )
+        if prior.data:
+            job = prior.data[0]
+            logger.info("Idempotent replay of job %s for user %s", job["id"], user_id)
+            response.status_code = 200
+            request.state.audit_target_id = job["id"]
+            return {"job_id": job["id"], "status": job["status"], "idempotent_replay": True}
+
+    if not req.leads:
+        raise HTTPException(status_code=400, detail="No leads provided.")
+    if len(req.leads) > MAX_LEADS_PER_REQUEST:
+        raise HTTPException(
+            status_code=400,
+            detail=f"At most {MAX_LEADS_PER_REQUEST} leads can be processed per request.",
+        )
+    lead_ids = [lead.get("id") for lead in req.leads]
+    if any(i is None for i in lead_ids):
+        raise HTTPException(status_code=400, detail="Every lead must include its id.")
+    owned = (
+        supabase.table("leads").select("id").eq("user_id", user_id).in_("id", lead_ids).execute()
+    )
+    if len(owned.data or []) != len(set(lead_ids)):
+        raise HTTPException(status_code=404, detail="One or more leads not found.")
+
+
+    llm_key, tavily_key, uses_own_keys, _ = _resolve_api_keys(user_id, for_job=True)
+    used_today = 0 if uses_own_keys else _leads_used_today(user_id)
+    if not uses_own_keys and used_today + len(req.leads) > DAILY_LEAD_CAP:
+        remaining = max(0, DAILY_LEAD_CAP - used_today)
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                f"Daily limit reached — {DAILY_LEAD_CAP} leads per day. "
+                f"You've used {used_today} today"
+                + (f", so you can process {remaining} more." if remaining
+                   else ". Try again tomorrow.")
+            ),
+            headers={"Retry-After": str(_seconds_until_utc_midnight())},
+        )
+
+    profile = supabase.table("users").select("company_context").eq("id", user_id).execute()
+    company_context = (profile.data[0].get("company_context") if profile.data else None) or ""
+    if not company_context.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="Set your company profile & ICP before processing leads.",
+        )
+    _enforce_rate_limit("process", user_id, len(req.leads))
+
+    job = {
+        "user_id": user_id,
+        "status": "pending",
+        "leads": req.leads,
+
+        "our_company_context": company_context,
+        "force_refresh": req.force_refresh,
+
+
+        "gemini_api_key": llm_key,
+        "tavily_api_key": tavily_key,
+    }
+
+
+    if idempotency_key:
+        job["idempotency_key"] = idempotency_key
+    try:
+        resp = supabase.table("jobs").insert(job).execute()
+    except Exception:
+
+
+        if not idempotency_key:
+            raise
+        prior = (
+            supabase.table("jobs").select("id,status")
+            .eq("user_id", user_id).eq("idempotency_key", idempotency_key)
+            .limit(1).execute()
+        )
+        if not prior.data:
+            raise
+        logger.info("Lost the idempotency race for key; returning job %s", prior.data[0]["id"])
+        response.status_code = 200
+        request.state.audit_target_id = prior.data[0]["id"]
+        return {"job_id": prior.data[0]["id"], "status": prior.data[0]["status"],
+                "idempotent_replay": True}
+    if not resp.data:
+        raise HTTPException(status_code=500, detail="Failed to enqueue processing job.")
+    job_id = resp.data[0]["id"]
+    request.state.audit_target_id = job_id
+    logger.info("Enqueued job %s (%d lead(s)) for user %s", job_id, len(req.leads), user_id)
+    return {"job_id": job_id, "status": "pending"}
+
+
+@app.get("/jobs/{job_id}")
+async def get_job(job_id: str, user_id: str = Depends(current_user)):
+    resp = await (
+        supabase_async.table("jobs")
+        .select("id,user_id,status,results,error,created_at,progress")
+        .eq("id", job_id)
+        .execute()
+    )
+    if not resp.data or str(resp.data[0].get("user_id")) != user_id:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    job = resp.data[0]
+    job.pop("user_id", None)
+    return job
+
+
+@app.get("/analysis/{lead_id}")
+def get_analysis(lead_id: str, user_id: str = Depends(current_user)):
+    _get_owned_lead(lead_id, user_id)
+    try:
+        resp = supabase.table("analysis_runs").select("*").eq("lead_id", lead_id).execute()
+    except Exception as exc:
+        logger.error("Failed to fetch analysis for lead %s: %s", lead_id, exc)
+        raise HTTPException(status_code=500, detail="Failed to fetch analysis data.")
+    if not resp.data:
+        raise HTTPException(status_code=404, detail="No analysis data found.")
+    return resp.data[0]
+
+
+def persist_results(
+    leads: list, scores: list, emails: list, agent_times: dict, cache_hits: list, elapsed: float,
+) -> list:
+    """
+    Write scores/emails/analysis to Supabase for each processed lead.
+    `emails` is aligned with `leads` (None where the lead scored below the
+    email threshold). `cache_hits` is aligned with `leads` (True where
+    company research was served from cache). Returns a summary list for the
+    job record.
+    """
+    results = []
+    for lead, score_obj, email_draft, cache_hit in zip(leads, scores, emails, cache_hits):
+        with lead_context(lead["id"]):
+            results.append(_persist_one_lead(lead, score_obj, email_draft, agent_times, cache_hit, elapsed))
+    return results
+
+
+def _persist_one_lead(
+    lead: dict, score_obj, email_draft, agent_times: dict, cache_hit: bool, elapsed: float,
+) -> dict:
+    if score_obj.cost_usd is None or (email_draft and email_draft.cost_usd is None):
+        raise ValueError("Pipeline did not report model cost for this lead.")
+    pyd = score_obj.pydantic
+    update_payload = {
+        "score":          pyd.lead_score.score,
+        "scoring_result": pyd.dict(),
+    }
+    if email_draft is not None:
+        update_payload["email_draft"] = email_draft.raw
+    supabase.table("leads").update(update_payload).eq("id", lead["id"]).execute()
+
+
+    score_usage = score_obj.token_usage
+    email_usage = email_draft.token_usage if email_draft else None
+    score_tokens  = getattr(score_usage, "total_tokens",      0) or 0
+    email_tokens  = getattr(email_usage, "total_tokens",      0) or 0
+    total_tokens = score_tokens + email_tokens
+
+    total_cost = round(score_obj.cost_usd + (email_draft.cost_usd if email_draft else 0), 6)
+    cost_per_token = (total_cost / total_tokens) if total_tokens else 0.0
+
+    email_tasks = (email_draft.tasks_output if email_draft else None) or []
+
+
+    crew_buckets = []
+    if score_obj.company_output is not None:
+        company_out = score_obj.company_output
+        crew_buckets.append((
+            company_out.tasks_output or [],
+            getattr(company_out.token_usage, "total_tokens", 0) or 0,
+        ))
+    scoring_out = score_obj.scoring_output
+    crew_buckets.append((
+        scoring_out.tasks_output or [],
+        getattr(scoring_out.token_usage, "total_tokens", 0) or 0,
+    ))
+    if email_tasks:
+        crew_buckets.append((email_tasks, email_tokens))
+
+    agents_data = []
+    for tasks, crew_tokens in crew_buckets:
+        split = crew_tokens // len(tasks) if tasks else 0
+        for t in tasks:
+            name = t.agent if isinstance(t.agent, str) else getattr(t.agent, "role", str(t.agent))
+            exact = getattr(t, "tokens", None)
+            tokens = split if exact is None else exact
+            agents_data.append({
+                "agent": name, "status": "Success",
+                "tokens": tokens,
+                "cost": round(t.cost, 6) if t.cost is not None else round(tokens * cost_per_token, 6),
+                "time_seconds": agent_times.get(name),
+            })
+    if cache_hit:
+
+        agents_data.append({
+            "agent": "Company Research & Cultural Fit Analyst",
+            "status": "Cached", "tokens": 0, "cost": 0.0, "time_seconds": 0,
+        })
+    if email_draft is None:
+
+
+        agents_data.append({
+            "agent": "Email Specialist",
+            "status": "Skipped", "tokens": 0, "cost": 0.0, "time_seconds": 0,
+        })
+
+    analysis_record = {
+        "lead_id":          lead["id"],
+        "duration_seconds": elapsed,
+        "total_tokens":     total_tokens,
+        "total_cost":       total_cost,
+        "success_rate":     100.0,
+        "agents_executed":  len(agents_data),
+        "agents_data":      agents_data,
+    }
+    try:
+        existing = supabase.table("analysis_runs").select("id").eq("lead_id", lead["id"]).execute()
+        if existing.data:
+            supabase.table("analysis_runs").update(analysis_record).eq("lead_id", lead["id"]).execute()
+        else:
+            supabase.table("analysis_runs").insert(analysis_record).execute()
+    except Exception as exc:
+        logger.warning("Failed to save analysis for lead %s: %s", lead.get("name"), exc)
+
+    logger.info("Processed lead %s — score %s", lead.get("name"), pyd.lead_score.score)
+    return {
+        "lead_id": lead["id"],
+        "score": pyd.lead_score.score,
+        "email_drafted": email_draft is not None,
+    }
+
+
+if os.getenv("RUN_WORKER_IN_PROCESS") == "1":
+    import threading
+
+    @app.on_event("startup")
+    def _start_worker_thread():
+        import asyncio
+        from worker import main as worker_main
+
+
+        threading.Thread(
+            target=lambda: asyncio.run(worker_main()), daemon=True, name="job-worker",
+        ).start()
+        logger.info("In-process worker thread started (RUN_WORKER_IN_PROCESS=1)")

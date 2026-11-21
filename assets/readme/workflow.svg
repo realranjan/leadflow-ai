@@ -1,0 +1,85 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="180" viewBox="0 0 1200 180" role="img" aria-labelledby="flow-title flow-desc">
+  <title id="flow-title">LeadFlow AI · Step-by-Step Execution Sequence</title>
+  <desc id="flow-desc">Five-stage autonomous lead qualification and email synthesis pipeline workflow.</desc>
+
+  <defs>
+    <linearGradient id="flow-bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#080C14"/>
+      <stop offset="100%" stop-color="#0B111D"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1200" height="180" rx="16" fill="url(#flow-bg)"/>
+  <rect width="1200" height="180" rx="16" fill="none" stroke="#1E293B" stroke-width="1.5"/>
+
+  <!-- Step 1 -->
+  <g transform="translate(36, 32)">
+    <rect width="200" height="116" rx="10" fill="#111927" stroke="#1F2E47" stroke-width="1"/>
+    <rect x="14" y="14" width="28" height="28" rx="6" fill="#3B82F6" fill-opacity="0.2"/>
+    <text x="28" y="33" fill="#60A5FA" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="14" font-weight="700" text-anchor="middle">1</text>
+    <text x="50" y="32" fill="#F8FAFC" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="13" font-weight="600">Ingest Lead</text>
+    <text x="14" y="66" fill="#94A3B8" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="11">Target lead profile,</text>
+    <text x="14" y="82" fill="#94A3B8" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="11">company &amp; ICP specs</text>
+    <text x="14" y="100" fill="#38BDF8" font-family="ui-monospace, monospace" font-size="10">HTTP 202 Accepted</text>
+  </g>
+
+  <!-- Arrow 1 to 2 -->
+  <path d="M 244 90 L 268 90" stroke="#334155" stroke-width="2"/>
+  <polygon points="268,90 262,86 262,94" fill="#334155"/>
+
+  <!-- Step 2 -->
+  <g transform="translate(276, 32)">
+    <rect width="200" height="116" rx="10" fill="#111927" stroke="#1F2E47" stroke-width="1"/>
+    <rect x="14" y="14" width="28" height="28" rx="6" fill="#6366F1" fill-opacity="0.2"/>
+    <text x="28" y="33" fill="#818CF8" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="14" font-weight="700" text-anchor="middle">2</text>
+    <text x="50" y="32" fill="#F8FAFC" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="13" font-weight="600">Parallel Research</text>
+    <text x="14" y="66" fill="#94A3B8" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="11">Company + Personal</text>
+    <text x="14" y="82" fill="#94A3B8" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="11">Tavily Search + Cache</text>
+    <text x="14" y="100" fill="#818CF8" font-family="ui-monospace, monospace" font-size="10">Concurrent Agents</text>
+  </g>
+
+  <!-- Arrow 2 to 3 -->
+  <path d="M 484 90 L 508 90" stroke="#334155" stroke-width="2"/>
+  <polygon points="508,90 502,86 502,94" fill="#334155"/>
+
+  <!-- Step 3 -->
+  <g transform="translate(516, 32)">
+    <rect width="200" height="116" rx="10" fill="#111927" stroke="#1F2E47" stroke-width="1"/>
+    <rect x="14" y="14" width="28" height="28" rx="6" fill="#EC4899" fill-opacity="0.2"/>
+    <text x="28" y="33" fill="#F472B6" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="14" font-weight="700" text-anchor="middle">3</text>
+    <text x="50" y="32" fill="#F8FAFC" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="13" font-weight="600">7-Judge Consensus</text>
+    <text x="14" y="66" fill="#94A3B8" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="11">Probability-weighted</text>
+    <text x="14" y="82" fill="#94A3B8" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="11">multi-attribute score</text>
+    <text x="14" y="100" fill="#F472B6" font-family="ui-monospace, monospace" font-size="10">98.3% Accuracy</text>
+  </g>
+
+  <!-- Arrow 3 to 4 -->
+  <path d="M 724 90 L 748 90" stroke="#334155" stroke-width="2"/>
+  <polygon points="748,90 742,86 742,94" fill="#334155"/>
+
+  <!-- Step 4 -->
+  <g transform="translate(756, 32)">
+    <rect width="200" height="116" rx="10" fill="#111927" stroke="#1F2E47" stroke-width="1"/>
+    <rect x="14" y="14" width="28" height="28" rx="6" fill="#F59E0B" fill-opacity="0.2"/>
+    <text x="28" y="33" fill="#FBBF24" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="14" font-weight="700" text-anchor="middle">4</text>
+    <text x="50" y="32" fill="#F8FAFC" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="13" font-weight="600">Draft Synthesis</text>
+    <text x="14" y="66" fill="#94A3B8" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="11">Personalized hooks</text>
+    <text x="14" y="82" fill="#94A3B8" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="11">Triggered if Score &gt; 70</text>
+    <text x="14" y="100" fill="#FBBF24" font-family="ui-monospace, monospace" font-size="10">Gemini 3.6 Flash</text>
+  </g>
+
+  <!-- Arrow 4 to 5 -->
+  <path d="M 964 90 L 988 90" stroke="#334155" stroke-width="2"/>
+  <polygon points="988,90 982,86 982,94" fill="#334155"/>
+
+  <!-- Step 5 -->
+  <g transform="translate(996, 32)">
+    <rect width="168" height="116" rx="10" fill="#111927" stroke="#10B981" stroke-opacity="0.5" stroke-width="1"/>
+    <rect x="14" y="14" width="28" height="28" rx="6" fill="#10B981" fill-opacity="0.2"/>
+    <text x="28" y="33" fill="#34D399" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="14" font-weight="700" text-anchor="middle">5</text>
+    <text x="50" y="32" fill="#F8FAFC" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="13" font-weight="600">Review &amp; Send</text>
+    <text x="14" y="66" fill="#94A3B8" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="11">Editable preview,</text>
+    <text x="14" y="82" fill="#94A3B8" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="11">1-click SMTP send</text>
+    <text x="14" y="100" fill="#34D399" font-family="ui-monospace, monospace" font-size="10">Audit Logged</text>
+  </g>
+</svg>
